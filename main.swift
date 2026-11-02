@@ -44,15 +44,29 @@ func parseDate(_ s: String?) -> Date? {
 // Undocumented endpoint Claude Code itself uses for /usage. May break without notice.
 struct PR: Decodable, Identifiable {
     struct Repo: Decodable { let name: String }
+    struct Commits: Decodable {
+        struct Node: Decodable {
+            struct Commit: Decodable { struct Rollup: Decodable { let state: String }; let statusCheckRollup: Rollup? }
+            let commit: Commit
+        }
+        let nodes: [Node]
+    }
     let number: Int, title: String, url: String, repository: Repo
+    var commits: Commits? = nil
     var id: String { url }
+    /// SUCCESS, FAILURE, ERROR, PENDING, EXPECTED, or nil when the repo has no checks
+    var ci: String? { commits?.nodes.first?.commit.statusCheckRollup?.state }
+    var failing: Bool { ci == "FAILURE" || ci == "ERROR" }
 }
 
-/// Open PRs via the GitHub CLI (uses its existing login). Empty if gh is missing or logged out.
+/// Open PRs + CI state of their last commit, via the GitHub CLI's existing login.
+/// Empty if gh is missing or logged out.
 func fetchPRs(_ filter: String) -> [PR] {
+    struct Response: Decodable { struct D: Decodable { struct S: Decodable { let nodes: [PR] }; let search: S }; let data: D }
     guard let gh = ["/opt/homebrew/bin/gh", "/usr/local/bin/gh"].first(where: FileManager.default.isExecutableFile) else { return [] }
-    let out = sh(gh, ["search", "prs", filter, "--state=open", "--json", "number,title,url,repository", "--limit", "30"])
-    return (try? JSONDecoder().decode([PR].self, from: out)) ?? []
+    let query = "query($q:String!){search(query:$q,type:ISSUE,first:30){nodes{... on PullRequest{number title url repository{name} commits(last:1){nodes{commit{statusCheckRollup{state}}}}}}}}"
+    let out = sh(gh, ["api", "graphql", "-f", "q=is:pr is:open archived:false \(filter)", "-f", "query=\(query)"])
+    return (try? JSONDecoder().decode(Response.self, from: out))?.data.search.nodes ?? []
 }
 
 func fetchLimits() -> Usage? {
@@ -139,9 +153,10 @@ final class Model: ObservableObject {
         pollAgents()
         DispatchQueue.global().async {
             let limits = fetchLimits(), tokens = scanTokens()
-            let review = fetchPRs("--review-requested=@me")
+            let review = fetchPRs("review-requested:@me")
             var seen = Set<String>()
-            let mine = (fetchPRs("--author=@me") + fetchPRs("--assignee=@me")).filter { seen.insert($0.url).inserted }
+            let mine = (fetchPRs("author:@me") + fetchPRs("assignee:@me")).filter { seen.insert($0.url).inserted }
+                .sorted { $0.failing && !$1.failing }   // red builds first, so they make the top 3
             DispatchQueue.main.async {
                 self.tokens = tokens; self.toReview = review; self.mine = mine
                 if let limits { self.limits = limits } // keep last good value on network error
@@ -264,6 +279,28 @@ struct Preset: View {
     }
 }
 
+/// CI of a PR's last commit. Monochrome: failure is the only full-white mark, so it's the one that catches the eye.
+struct CIBadge: View {
+    let state: String?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    var body: some View {
+        Group {
+            switch state {
+            case "SUCCESS": Image(systemName: "checkmark").foregroundStyle(Tone.dim)
+            case "FAILURE", "ERROR": Image(systemName: "xmark").foregroundStyle(Tone.fg).fontWeight(.bold)
+            case "PENDING", "EXPECTED":
+                Image(systemName: "circle.dotted").foregroundStyle(Tone.dim)
+                    .symbolEffect(.rotate, options: .repeat(.continuous), isActive: !reduceMotion)
+            default: Color.clear
+            }
+        }
+        .font(.system(size: 10))
+        .frame(width: 12)
+        .help(state.map { "CI: \($0.lowercased())" } ?? "No CI")
+        .accessibilityLabel(state.map { "CI \($0.lowercased())" } ?? "No CI")
+    }
+}
+
 struct PRList: View {
     static let shown = 3
     let title: String, prs: [PR], all: String
@@ -287,6 +324,7 @@ struct PRList: View {
                         HStack(spacing: 4) {
                             Text(pr.repository.name).lineLimit(1).truncationMode(.tail)
                             Text("#\(pr.number)").monospacedDigit().layoutPriority(1)
+                            CIBadge(state: pr.ci)
                         }
                         .foregroundStyle(Tone.dim).frame(maxWidth: 150, alignment: .trailing)
                     }
@@ -322,6 +360,11 @@ struct NotchView: View {
                 Label("\(m.toReview.count)", systemImage: "arrow.triangle.pull").monospacedDigit()
                     .padding(.leading, 8)
                     .accessibilityLabel("\(m.toReview.count) pull requests waiting for your review")
+            }
+            if case let failing = m.mine.filter(\.failing).count, failing > 0 {
+                Label("\(failing)", systemImage: "xmark").monospacedDigit()
+                    .padding(.leading, 8)
+                    .accessibilityLabel("\(failing) of your pull requests failing CI")
             }
             Spacer()
             Group {
@@ -493,8 +536,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 if CommandLine.arguments.count > 2, CommandLine.arguments[1] == "--snapshot" { MainActor.assumeIsolated {
     let m = Model()
     let fake = { (n: Int, t: String) in PR(number: n, title: t, url: "u\(n)", repository: .init(name: n > 100 ? "web-app" : "design-system")) }
+    let ci = { (state: String) in PR.Commits(nodes: [.init(commit: .init(statusCheckRollup: .init(state: state)))]) }
     m.toReview = [fake(137, "Add cache headers to product pages"), fake(12, "Fix mobile header overlap")]
+    m.toReview[0].commits = ci("SUCCESS")
     m.mine = ["Dark mode tokens", "Button focus ring", "Docs: theming guide", "Bump deps", "Icon set v2"].enumerated().map { fake($0.offset + 40, $0.element) }
+    m.mine[0].commits = ci("FAILURE"); m.mine[1].commits = ci("PENDING"); m.mine[2].commits = ci("SUCCESS")
     m.agents = 3; m.working = 1; m.pomo = 14 * 60 + 7; m.length = 25 * 60; m.running = true
     m.tokens = (today: 42_000_000, month: 1_200_000_000, top: "claude-opus-5-5")
     let reset = ISO8601DateFormatter().string(from: Date().addingTimeInterval(3 * 3600 + 7 * 60))
