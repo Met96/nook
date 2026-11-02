@@ -78,8 +78,14 @@ func fetchLimits() -> Usage? {
     req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
     let sem = DispatchSemaphore(value: 0)
     var out: Usage?
-    URLSession.shared.dataTask(with: req) { d, _, _ in
-        out = d.flatMap { try? JSONDecoder().decode(Usage.self, from: $0) }; sem.signal()
+    URLSession.shared.dataTask(with: req) { d, resp, _ in
+        // Only a real 200 with data counts: an error body (e.g. 429) also decodes, as an empty Usage.
+        if (resp as? HTTPURLResponse)?.statusCode == 200, let d,
+           let u = try? JSONDecoder().decode(Usage.self, from: d), u.five_hour != nil {
+            out = u
+            UserDefaults.standard.set(d, forKey: "limits")   // survives relaunches
+        }
+        sem.signal()
     }.resume()
     sem.wait()
     return out
@@ -112,7 +118,8 @@ func scanTokens() -> (today: Int, month: Int, top: String) {
 final class Model: ObservableObject {
     @Published var agents = 0
     @Published var working = 0
-    @Published var limits: Usage?
+    @Published var limits: Usage? = UserDefaults.standard.data(forKey: "limits").flatMap { try? JSONDecoder().decode(Usage.self, from: $0) }
+    var lastLimitsFetch = Date.distantPast
     @Published var tokens = (today: 0, month: 0, top: "–")
     @Published var toReview: [PR] = []
     @Published var mine: [PR] = []   // authored by me or assigned to me
@@ -151,15 +158,19 @@ final class Model: ObservableObject {
 
     func refresh() {
         pollAgents()
+        // limits change slowly and the endpoint rate-limits (429): try at most every 5 min, success or not
+        let askLimits = Date().timeIntervalSince(lastLimitsFetch) > 300
+        if askLimits { lastLimitsFetch = Date() }
         DispatchQueue.global().async {
-            let limits = fetchLimits(), tokens = scanTokens()
+            let limits = askLimits ? fetchLimits() : nil
+            let tokens = scanTokens()
             let review = fetchPRs("review-requested:@me")
             var seen = Set<String>()
             let mine = (fetchPRs("author:@me") + fetchPRs("assignee:@me")).filter { seen.insert($0.url).inserted }
                 .sorted { $0.failing && !$1.failing }   // red builds first, so they make the top 3
             DispatchQueue.main.async {
                 self.tokens = tokens; self.toReview = review; self.mine = mine
-                if let limits { self.limits = limits } // keep last good value on network error
+                if let limits { self.limits = limits } // keep last good value on errors
             }
         }
     }
