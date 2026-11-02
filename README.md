@@ -44,7 +44,7 @@ Nook is a small companion with one job: keep watch so you don't have to.
 | **Agents** | ✦ spins while a Claude Code session is working, sits still when idle, fades when none are open |
 | **Limits** | Session (5h) and weekly usage left, with time to reset |
 | **Tokens** | Today, last 30 days, and your top model — read from local Claude Code logs |
-| **Pull requests** | PRs waiting for your review, and PRs you opened or are assigned to. Click to open |
+| **Pull requests** | PRs waiting for your review, and PRs you opened or are assigned to, with CI status (✓ passing, ◌ running, ✕ failing). Failing builds float to the top. Click to open |
 | **Focus timer** | 15 / 25 / 45 min presets or a custom length. Collapsed, it's a single hairline draining into the notch |
 | **Focus complete** | Pauses Spotify, Apple Music and YouTube, loops a chime, and opens the notch until you dismiss it |
 
