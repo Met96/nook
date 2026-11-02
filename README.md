@@ -14,7 +14,7 @@
   <img alt="macOS 15+" src="https://img.shields.io/badge/macOS-15%2B-black?logo=apple">
   <img alt="Swift" src="https://img.shields.io/badge/Swift-single%20file-black?logo=swift">
   <img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-black">
-  <a href="https://buymeacoffee.com/BMC_USERNAME"><img alt="Buy Me a Coffee" src="https://img.shields.io/badge/Buy%20me%20a%20coffee-support-black?logo=buymeacoffee"></a>
+  <a href="https://buymeacoffee.com/mattiamarescotti"><img alt="Buy Me a Coffee" src="https://img.shields.io/badge/Buy%20me%20a%20coffee-support-black?logo=buymeacoffee"></a>
 </p>
 
 <p align="center">
@@ -140,7 +140,7 @@ pkill -x Nook; rm -rf /Applications/Nook.app
 
 If Nook saves you a few context switches a day, you can buy me a coffee ☕
 
-<a href="https://buymeacoffee.com/BMC_USERNAME"><img src="https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20coffee&emoji=&slug=BMC_USERNAME&button_colour=000000&font_colour=ffffff&font_family=Inter&outline_colour=ffffff&coffee_colour=ffffff" alt="Buy Me a Coffee" height="44"></a>
+<a href="https://buymeacoffee.com/mattiamarescotti"><img src="https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20coffee&emoji=&slug=mattiamarescotti&button_colour=000000&font_colour=ffffff&font_family=Inter&outline_colour=ffffff&coffee_colour=ffffff" alt="Buy Me a Coffee" height="44"></a>
 
 ## License
 
