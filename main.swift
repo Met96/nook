@@ -32,13 +32,12 @@ func sh(_ path: String, _ args: [String]) -> Data {
     return d
 }
 
+// Formatters are expensive to build (thread-safe, so shared); parseDate runs per log line and on every render.
+private let isoFrac: ISO8601DateFormatter = { let f = ISO8601DateFormatter(); f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]; return f }()
+private let isoPlain = ISO8601DateFormatter()
 func parseDate(_ s: String?) -> Date? {
     guard let s else { return nil }
-    let f = ISO8601DateFormatter()
-    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    if let d = f.date(from: s) { return d }
-    f.formatOptions = [.withInternetDateTime]
-    return f.date(from: s)
+    return isoFrac.date(from: s) ?? isoPlain.date(from: s)
 }
 
 // Undocumented endpoint Claude Code itself uses for /usage. May break without notice.
@@ -91,25 +90,51 @@ func fetchLimits() -> Usage? {
     return out
 }
 
-// ponytail: rescans all 30d of logs every refresh; cache per-file offsets if it gets slow.
+/// Serial queue for all background work, so scans never overlap and the cache below needs no lock.
+let work = DispatchQueue(label: "nook.work", qos: .utility)
+
+struct TokenEntry { let id: String?, ts: Date, n: Int, model: String? }
+/// Per log file: bytes already parsed + what they contained. Logs are append-only, so each scan reads only the tail.
+private var tokenCache: [URL: (offset: UInt64, entries: [TokenEntry])] = [:]
+
 func scanTokens() -> (today: Int, month: Int, top: String) {
     let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
     let cutoff = Date().addingTimeInterval(-30 * 86400), dayStart = Calendar.current.startOfDay(for: Date())
     let keys = ["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"]
+    let usageMark = Data("\"usage\"".utf8)
+    var live = Set<URL>()
+    for case let url as URL in FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey]) ?? .init()
+    where url.pathExtension == "jsonl" {
+        guard let v = try? url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey]),
+              let mod = v.contentModificationDate, mod > cutoff, let size = v.fileSize.map(UInt64.init) else { continue }
+        live.insert(url)
+        var c = tokenCache[url] ?? (0, [])
+        if size < c.offset { c = (0, []) }   // truncated/rewritten: start over
+        if size > c.offset, let h = try? FileHandle(forReadingFrom: url) {
+            try? h.seek(toOffset: c.offset)
+            let data = (try? h.readToEnd()) ?? Data(); try? h.close()
+            if let nl = data.lastIndex(of: 10) {   // only complete lines; a half-written one is read next time
+                c.offset += UInt64(nl - data.startIndex + 1)
+                for line in data[..<nl].split(separator: 10) where line.range(of: usageMark) != nil {
+                    guard let o = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+                          let msg = o["message"] as? [String: Any], let u = msg["usage"] as? [String: Any],
+                          let ts = parseDate(o["timestamp"] as? String) else { continue }
+                    c.entries.append(.init(id: msg["id"] as? String, ts: ts, n: keys.reduce(0) { $0 + ((u[$1] as? Int) ?? 0) },
+                                           model: (msg["model"] as? String).flatMap { $0.hasPrefix("<") ? nil : $0 }))
+                }
+            }
+        }
+        tokenCache[url] = c
+    }
+    tokenCache = tokenCache.filter { live.contains($0.key) }   // forget deleted / >30d files
+
     var seen = Set<String>(), today = 0, month = 0, byModel: [String: Int] = [:]
-    guard let e = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey]) else { return (0, 0, "–") }
-    for case let url as URL in e where url.pathExtension == "jsonl" {
-        guard let mod = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate, mod > cutoff,
-              let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
-        for line in text.split(separator: "\n") where line.contains("\"usage\"") {
-            guard let o = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
-                  let msg = o["message"] as? [String: Any], let u = msg["usage"] as? [String: Any],
-                  let ts = parseDate(o["timestamp"] as? String), ts > cutoff else { continue }
-            if let id = msg["id"] as? String, !seen.insert(id).inserted { continue } // streamed msgs repeat
-            let n = keys.reduce(0) { $0 + ((u[$1] as? Int) ?? 0) }
-            month += n
-            if let model = msg["model"] as? String, !model.hasPrefix("<") { byModel[model, default: 0] += n }
-            if ts >= dayStart { today += n }
+    for (_, c) in tokenCache {
+        for e in c.entries where e.ts > cutoff {
+            if let id = e.id, !seen.insert(id).inserted { continue } // streamed msgs repeat
+            month += e.n
+            if let m = e.model { byModel[m, default: 0] += e.n }
+            if e.ts >= dayStart { today += e.n }
         }
     }
     return (today, month, byModel.max { $0.value < $1.value }?.key ?? "–")
@@ -133,43 +158,54 @@ final class Model: ObservableObject {
     @Published var expanded = false
 
     func start() {
-        refresh()
-        Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { _ in self.refresh() }
-        Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in self.pollAgents() }
-        Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in self.tick() }
-    }
-
-    // open = claude processes; working = session logs written in the last 10s
-    // ponytail: walks all log files every 3s; watch with FSEvents if it ever shows up in CPU.
-    func pollAgents() {
-        DispatchQueue.global().async {
-            let open = String(decoding: sh("/usr/bin/pgrep", ["-x", "claude"]), as: UTF8.self)
-                .split(separator: "\n").count
-            let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
-            let recent = Date().addingTimeInterval(-10)
-            var working = 0
-            for case let url as URL in FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.contentModificationDateKey]) ?? .init()
-            where url.pathExtension == "jsonl" && url.deletingLastPathComponent().lastPathComponent != "subagents" {
-                if let d = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate, d > recent { working += 1 }
-            }
-            DispatchQueue.main.async { self.agents = open; self.working = min(working, open) }
+        refresh(); pollAgents()
+        // Tolerance lets macOS batch these wakeups with others: the biggest idle-energy lever for a background app.
+        for (s, f) in [(60.0, refresh), (5, pollAgents), (1, tick)] {
+            Timer.scheduledTimer(withTimeInterval: s, repeats: true) { _ in f() }.tolerance = s * 0.2
         }
     }
 
+    // open = claude processes; working = session logs (projects/<p>/<session>.jsonl) written in the last 10s
+    func pollAgents() {
+        work.async {
+            let open = String(decoding: sh("/usr/bin/pgrep", ["-x", "claude"]), as: UTF8.self)
+                .split(separator: "\n").count
+            let fm = FileManager.default, root = fm.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
+            let recent = Date().addingTimeInterval(-10)
+            var working = 0
+            for proj in (try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? [] {
+                for url in (try? fm.contentsOfDirectory(at: proj, includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+                where url.pathExtension == "jsonl" {
+                    if let d = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate, d > recent { working += 1 }
+                }
+            }
+            DispatchQueue.main.async {   // assign only on change: every publish re-renders the whole view
+                if self.agents != open { self.agents = open }
+                if self.working != min(working, open) { self.working = min(working, open) }
+            }
+        }
+    }
+
+    var lastPRFetch = Date.distantPast
     func refresh() {
-        pollAgents()
-        // limits change slowly and the endpoint rate-limits (429): try at most every 5 min, success or not
+        // limits rate-limit (429) and PRs cost 3 gh processes + network: both at most every 5 min
         let askLimits = Date().timeIntervalSince(lastLimitsFetch) > 300
         if askLimits { lastLimitsFetch = Date() }
-        DispatchQueue.global().async {
+        let askPRs = Date().timeIntervalSince(lastPRFetch) > 300
+        if askPRs { lastPRFetch = Date() }
+        work.async {
             let limits = askLimits ? fetchLimits() : nil
             let tokens = scanTokens()
-            let review = fetchPRs("review-requested:@me")
-            var seen = Set<String>()
-            let mine = (fetchPRs("author:@me") + fetchPRs("assignee:@me")).filter { seen.insert($0.url).inserted }
-                .sorted { $0.failing && !$1.failing }   // red builds first, so they make the top 3
+            var prs: ([PR], [PR])?
+            if askPRs {
+                var seen = Set<String>()
+                prs = (fetchPRs("review-requested:@me"),
+                       (fetchPRs("author:@me") + fetchPRs("assignee:@me")).filter { seen.insert($0.url).inserted }
+                           .sorted { $0.failing && !$1.failing })   // red builds first, so they make the top 3
+            }
             DispatchQueue.main.async {
-                self.tokens = tokens; self.toReview = review; self.mine = mine
+                if self.tokens != tokens { self.tokens = tokens }
+                if let prs { self.toReview = prs.0; self.mine = prs.1 }
                 if let limits { self.limits = limits } // keep last good value on errors
             }
         }
@@ -249,8 +285,7 @@ struct DrainLine: View {
                 Capsule().fill(Tone.fg).frame(width: g.size.width * progress)
                     .opacity(active ? 1 : 0.4)
             }
-            .animation(reduceMotion ? nil : .linear(duration: 1), value: progress)
-            .animation(.easeOut(duration: 0.25), value: active)
+            .animation(.easeOut(duration: 0.25), value: active)   // progress isn't animated: <1px/s, and animating it redrew all session
         }
         .frame(height: 2)
         .accessibilityHidden(true)
@@ -321,7 +356,7 @@ struct CIBadge: View {
             case "FAILURE", "ERROR": Image(systemName: "xmark").foregroundStyle(Tone.fg).fontWeight(.bold)
             case "PENDING", "EXPECTED":
                 Image(systemName: "circle.dotted").foregroundStyle(Tone.dim)
-                    .symbolEffect(.rotate, options: .repeat(.continuous), isActive: !reduceMotion)
+                    .symbolEffect(.rotate, options: .repeat(.periodic(delay: 4)), isActive: !reduceMotion)
             default: Color.clear
             }
         }
@@ -382,7 +417,7 @@ struct NotchView: View {
         HStack {
             HStack(spacing: 5) {
                 Image(systemName: "sparkle")
-                    .symbolEffect(.rotate, options: .repeat(.continuous), isActive: m.working > 0 && !reduceMotion)
+                    .symbolEffect(.rotate, options: .repeat(.periodic(delay: 3)), isActive: m.working > 0 && !reduceMotion)   // periodic, not continuous: a nonstop spin redraws every frame
                 Text("\(m.agents)").monospacedDigit()
             }
             .opacity(m.agents > 0 ? 1 : 0.4)
