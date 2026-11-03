@@ -210,11 +210,31 @@ enum Tone {
     static let faint = Color.white.opacity(0.14)
 }
 
+/// Quiet, native-feeling hover: rows get a soft highlight, dim icons light up, solid controls lift slightly.
 struct Press: ButtonStyle {
-    func makeBody(configuration c: Configuration) -> some View {
-        c.label.contentShape(Rectangle())
-            .opacity(c.isPressed ? 0.5 : 1).scaleEffect(c.isPressed ? 0.96 : 1)
+    enum Kind { case plain, dim, row }
+    var kind = Kind.plain
+    func makeBody(configuration c: Configuration) -> some View { Hoverable(c: c, kind: kind) }
+
+    struct Hoverable: View {
+        let c: Configuration, kind: Kind
+        @State private var hover = false
+        @Environment(\.accessibilityReduceMotion) private var reduceMotion
+        var body: some View {
+            Group {
+                if kind == .dim { c.label.foregroundStyle(hover ? Tone.fg : Tone.dim) } else { c.label }
+            }
+            .contentShape(Rectangle())
+            .background {
+                if kind == .row {
+                    RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(hover ? 0.08 : 0)).padding(.horizontal, -6)
+                }
+            }
+            .scaleEffect(c.isPressed ? 0.96 : kind == .plain && hover && !reduceMotion ? 1.04 : 1)
+            .opacity(c.isPressed ? 0.5 : 1)
             .animation(.easeOut(duration: 0.15), value: c.isPressed)
+            .onHover { h in withAnimation(.easeOut(duration: h ? 0.15 : 0.1)) { hover = h } }   // exit faster than enter
+        }
     }
 }
 
@@ -321,7 +341,7 @@ struct PRList: View {
             HStack {
                 Text("\(title) · \(prs.count)")
                 Spacer()
-                if prs.count > Self.shown { Button("All \(Image(systemName: "arrow.up.right"))") { open(all) }.buttonStyle(Press()) }
+                if prs.count > Self.shown { Button("All \(Image(systemName: "arrow.up.right"))") { open(all) }.buttonStyle(Press(kind: .dim)) }
             }
             .font(.system(size: 10, weight: .medium)).foregroundStyle(Tone.dim).frame(height: 14)
             if prs.isEmpty {
@@ -341,7 +361,7 @@ struct PRList: View {
                     }
                     .frame(height: 20)
                 }
-                .buttonStyle(Press())
+                .buttonStyle(Press(kind: .row))
                 .help(pr.title)
             }
         }
@@ -415,7 +435,7 @@ struct NotchView: View {
                 Button { m.running = false; m.pomo = m.length } label: {
                     Image(systemName: "arrow.counterclockwise").frame(width: 32, height: 32)
                 }
-                .buttonStyle(Press()).foregroundStyle(Tone.dim)
+                .buttonStyle(Press(kind: .dim))
                 .accessibilityLabel("Reset timer").help("Reset")
                 Button { m.running.toggle(); m.done = false } label: {
                     Image(systemName: m.running ? "pause.fill" : "play.fill")
@@ -434,12 +454,12 @@ struct NotchView: View {
                 }
                 Spacer()
                 Button { m.custom = max(5, m.custom - 5) } label: { Image(systemName: "minus").frame(width: 24, height: 24) }
-                    .buttonStyle(Press()).foregroundStyle(Tone.dim).accessibilityLabel("Five minutes less")
+                    .buttonStyle(Press(kind: .dim)).accessibilityLabel("Five minutes less")
                 Preset(label: "\(m.custom)", selected: m.length == m.custom * 60 && ![15, 25, 45].contains(m.custom)) {
                     m.startPomo(m.custom)
                 }
                 Button { m.custom = min(180, m.custom + 5) } label: { Image(systemName: "plus").frame(width: 24, height: 24) }
-                    .buttonStyle(Press()).foregroundStyle(Tone.dim).accessibilityLabel("Five minutes more")
+                    .buttonStyle(Press(kind: .dim)).accessibilityLabel("Five minutes more")
             }
         }
     }
@@ -453,7 +473,7 @@ struct NotchView: View {
                         Text(agentsText).foregroundStyle(m.agents > 0 ? Tone.fg : Tone.dim)
                         Spacer()
                         Button { NSApp.terminate(nil) } label: { Image(systemName: "power").frame(width: 24, height: 24) }
-                            .buttonStyle(Press()).foregroundStyle(Tone.dim)
+                            .buttonStyle(Press(kind: .dim))
                             .accessibilityLabel("Quit Nook").help("Quit")
                     }
                     Meter(title: "Session", w: m.limits?.five_hour)
